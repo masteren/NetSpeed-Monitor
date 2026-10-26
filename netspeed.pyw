@@ -297,17 +297,35 @@ class Store:
     def __init__(self):
         self.exists = os.path.exists(DATA_PATH)
         self.data = {"settings": {}, "usage": {}}
-        try:
-            with open(DATA_PATH, encoding="utf-8-sig") as f:
-                loaded = json.load(f)
-            self.data["settings"].update(loaded.get("settings", {}))
-            self.data["usage"].update(loaded.get("usage", {}))
-        except (OSError, ValueError, AttributeError):
-            pass
+        self.writable = True
+        if not self.exists:
+            return
+        for attempt in range(5):
+            try:
+                with open(DATA_PATH, encoding="utf-8-sig") as f:
+                    loaded = json.load(f)
+                self.data["settings"].update(loaded["settings"])
+                self.data["usage"].update(loaded["usage"])
+                return
+            except (ValueError, KeyError, TypeError, AttributeError):
+                # Damaged or hand-edited into invalid JSON: keep it as netspeed.json.bad instead of
+                # silently overwriting months of history with an empty file on the next save.
+                try:
+                    os.replace(DATA_PATH, DATA_PATH + ".bad")
+                except OSError:
+                    self.writable = False
+                self.data = {"settings": {}, "usage": {}}
+                return
+            except OSError:
+                time.sleep(0.2)   # e.g. briefly locked by an antivirus scan: try again
+        # Still unreadable: run with defaults but don't write, so the existing file survives.
+        self.writable = False
 
     def save(self):
         """Write the file; return False instead of raising when it can't be written (e.g. the file is
         briefly locked by an antivirus or sync tool), so a failed save never interrupts the UI."""
+        if not self.writable:
+            return False
         tmp = DATA_PATH + ".tmp"   # write then replace, so a crash mid-write can't corrupt the file
         try:
             with open(tmp, "w", encoding="utf-8") as f:
@@ -471,11 +489,13 @@ class SpeedMeter:
                 d_rx += max(0, c.bytes_recv - prev[0])   # counter reset / wrap-around counts as 0
                 d_tx += max(0, c.bytes_sent - prev[1])
         self.prev = current
-        self.dt = dt if 0 < dt < 30 else 0              # no speed on the first sample or after sleep
-        if not self.dt:
+        # No speed on the first sample or after a long gap (sleep, a stalled UI); the bytes still
+        # count towards the usage totals.
+        self.dt = dt if 0 < dt < 30 else 0
+        if self.dt:
+            self.down, self.up = d_rx / dt, d_tx / dt
+        else:
             self.down = self.up = 0.0
-            return 0, 0
-        self.down, self.up = d_rx / dt, d_tx / dt
         return d_rx, d_tx
 
 
@@ -663,7 +683,10 @@ class App:
         if self.cfg.first_run:
             self.cfg.save()
         LANG = system_language() if self.cfg.language == "auto" else self.cfg.language
-        ensure_icon_file()
+        try:
+            ensure_icon_file()
+        except OSError:
+            pass   # no custom icon, everything else still works
         self.meter = SpeedMeter()
         self.history = deque(maxlen=4000)        # (timestamp, down, up)
         self.start_time = time.time()
@@ -679,7 +702,10 @@ class App:
         self.root = tk.Tk()
         self.root.withdraw()
         self.root.title(t("app_name"))
-        self.root.iconbitmap(default=ICON_PATH)
+        try:
+            self.root.iconbitmap(default=ICON_PATH)
+        except tk.TclError:
+            pass
         self.dpi = self.root.winfo_fpixels("1i")
         ui = UI_FONTS[LANG]
         self.fonts = {
@@ -1341,8 +1367,10 @@ class SettingsWindow:
         self.row(fl, 3, t("theme"), themes)
         self.var_opacity = tk.IntVar(value=c.opacity)
         opacity = ttk.Frame(fl)
-        ttk.Scale(opacity, from_=40, to=100, variable=self.var_opacity, length=200,
-                  command=lambda v: self.set("opacity", int(float(v)), float_=True)).pack(side="left")
+        scale = ttk.Scale(opacity, from_=40, to=100, variable=self.var_opacity, length=200,
+                          command=self.on_opacity)
+        scale.bind("<ButtonRelease-1>", lambda e: self.app.cfg.save())   # save once per drag, not per step
+        scale.pack(side="left")
         self.lb_opacity = ttk.Label(opacity, width=5)
         self.lb_opacity.pack(side="left", padx=6)
         self.row(fl, 4, t("opacity"), opacity)
@@ -1400,6 +1428,11 @@ class SettingsWindow:
         self.app.main.refresh()
         self.refresh_status()
 
+    def on_opacity(self, value):
+        self.app.cfg.opacity = int(float(value))
+        self.app.float.apply_settings()
+        self.refresh_status()
+
     def set_int(self, var, key):
         try:
             value = max(1, int(var.get()))
@@ -1436,6 +1469,7 @@ class SettingsWindow:
         self.lb_status.configure(text=text)
 
     def close(self):
+        self.app.cfg.save()
         self.app.settings_win = None
         self.top.destroy()
 
