@@ -49,7 +49,7 @@ pythonw netspeed.pyw
 | Adapter names | `GetIfTable2` from `iphlpapi.dll` via `ctypes` maps names like "Ethernet" to hardware descriptions, which are used to recognise virtual adapters. |
 | Tray icon | `Shell_NotifyIconW` with a hidden window and a `ctypes` window procedure – no extra packages. The window procedure runs inside tkinter's message dispatch, so it only queues events; calling tkinter from there clears tkinter's saved thread state and crashes the process. |
 | Storage | One JSON file, written to a temporary file and then renamed, so a crash mid-write can't corrupt it. |
-| Display | Per-monitor DPI awareness, so text stays sharp at 125 % / 150 % scaling. Rounded corners on Windows 11 via `DwmSetWindowAttribute`. |
+| Display | DPI-aware, so text stays sharp at 125 % / 150 % scaling (on a multi-monitor setup with different scaling, windows on the secondary monitor are scaled by Windows and may look slightly soft). Rounded corners on Windows 11 via `DwmSetWindowAttribute`. |
 
 ## Privacy
 

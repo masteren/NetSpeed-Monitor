@@ -52,6 +52,11 @@ user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD, c
 user32.LoadImageW.restype = wt.HANDLE
 user32.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT, ctypes.c_int, ctypes.c_int, wt.UINT]
 kernel32.GetModuleHandleW.restype = wt.HMODULE
+# Separate handle with use_last_error=True: GetLastError() through windll can be overwritten
+# by the interpreter between calls, so the single-instance check reads ctypes.get_last_error().
+kernel32_le = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32_le.CreateMutexW.restype = wt.HANDLE
+kernel32_le.CreateMutexW.argtypes = [wt.LPVOID, wt.BOOL, wt.LPCWSTR]
 
 INTERVALS = [0.5, 1.0, 2.0, 5.0]
 RANGES = [1, 5, 15]   # chart time span in minutes
@@ -186,7 +191,7 @@ TEXTS = {
                     "this on an idle PC won't trigger it right away. A 30-second countdown lets you cancel "
                     "before anything happens, and the feature turns itself off after running once.",
         "applied": "Changes apply immediately", "close": "Close",
-        "tray_low": "Auto {action}: ", "tray_low_count": "low for {t}", "tray_low_wait": "waiting for traffic",
+        "tray_low": "{action} when idle: ", "tray_low_count": "low for {t}", "tray_low_wait": "waiting for traffic",
         "countdown": "The speed has stayed low. {action} in {n} seconds.", "act_now": "{action} now",
         "cancel": "Cancel",
     },
@@ -301,10 +306,16 @@ class Store:
             pass
 
     def save(self):
+        """Write the file; return False instead of raising when it can't be written (e.g. the file is
+        briefly locked by an antivirus or sync tool), so a failed save never interrupts the UI."""
         tmp = DATA_PATH + ".tmp"   # write then replace, so a crash mid-write can't corrupt the file
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, DATA_PATH)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, DATA_PATH)
+            return True
+        except OSError:
+            return False
 
 
 class Config:
@@ -333,7 +344,7 @@ class Config:
 
     def save(self):
         self.store.data["settings"] = {key: getattr(self, key) for key in DEFAULTS}
-        self.store.save()
+        return self.store.save()
 
 
 class Usage:
@@ -358,9 +369,9 @@ class Usage:
     def save(self):
         if not self.dirty:
             return
-        self.store.save()
-        self.dirty = False
-        self.last_save = time.time()
+        self.last_save = time.time()   # on failure, retry in 30 s rather than on every tick
+        if self.store.save():
+            self.dirty = False
 
     def day(self, d):
         return self.days.get(d.isoformat(), [0, 0])
@@ -446,7 +457,7 @@ class SpeedMeter:
         self.last = now
         try:
             counters = psutil.net_io_counters(pernic=True)
-            names = [adapter] if adapter else self.auto_names()
+            names = [adapter] if adapter in counters else self.auto_names()
         except Exception:
             counters, names = {}, []
         current, d_rx, d_tx = {}, 0, 0
@@ -585,8 +596,9 @@ class TrayIcon:
     NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
     NIF_MESSAGE, NIF_ICON, NIF_TIP = 1, 2, 4
 
-    def __init__(self, icon_path, tip):
+    def __init__(self, icon_path, tip, on_end_session):
         self.events = deque()
+        self.on_end_session = on_end_session   # must not touch tkinter (see the class docstring)
         self.tip = tip
         hinst = kernel32.GetModuleHandleW(None)
         self.proc = WNDPROC(self.wndproc)        # keep a reference or the callback gets garbage-collected
@@ -631,6 +643,9 @@ class TrayIcon:
                 user32.SetForegroundWindow(self.hwnd)   # pure Win32, safe here
                 self.events.append("menu")
             return 0
+        if msg == 0x0011:                       # WM_QUERYENDSESSION: Windows is shutting down / signing out
+            self.on_end_session()
+            return 1                            # allow it
         if msg == self.taskbar_created:         # Explorer restarted: add the icon again
             self.notify(self.NIM_ADD, self.NIF_MESSAGE | self.NIF_ICON | self.NIF_TIP)
             return 0
@@ -657,6 +672,8 @@ class App:
         self.low_active = False
         self.low_seconds = 0.0
         self.peak_dirty = False
+        self.last_peak_save = time.time()
+        self.tick_count = 0
         self.restart_requested = False
 
         self.root = tk.Tk()
@@ -680,7 +697,7 @@ class App:
         self.float = FloatWindow(self)
         self.main = MainWindow(self)
         self.settings_win = None
-        self.tray = TrayIcon(ICON_PATH, t("app_name"))
+        self.tray = TrayIcon(ICON_PATH, t("app_name"), self.save_all)
         self.poll_tray()
         if self.cfg.first_run:
             self.main.show()
@@ -748,12 +765,16 @@ class App:
             c.max_down, c.max_down_time, self.peak_dirty = down, now, True
         if up > c.max_up:
             c.max_up, c.max_up_time, self.peak_dirty = up, now, True
-        if self.peak_dirty and int(time.time()) % 15 == 0:
-            c.save()
-            self.peak_dirty = False
+        if self.peak_dirty and time.time() - self.last_peak_save >= 15:
+            self.last_peak_save = time.time()
+            if c.save():
+                self.peak_dirty = False
 
         self.check_low_speed(down, up, self.meter.dt)
         self.float.refresh()
+        self.tick_count += 1
+        if c.topmost and self.tick_count % 10 == 0:
+            self.float.reassert_topmost()
         self.main.refresh()
         if self.settings_win is not None:
             self.settings_win.refresh_status()
@@ -796,13 +817,17 @@ class App:
         self.meter.reset()
         self.meter.sample(name)
 
+    def save_all(self):
+        """Save settings and usage. Plain file I/O only, so it is safe to call from the tray's wndproc."""
+        self.cfg.save()
+        self.usage.save()
+
     def restart(self):
         self.restart_requested = True
         self.exit()
 
     def exit(self):
-        self.cfg.save()
-        self.usage.save()
+        self.save_all()
         self.tray.remove()
         self.root.destroy()
 
@@ -832,6 +857,11 @@ class FloatWindow:
         top.after(50, lambda: round_corners(top))
         if not app.cfg.float_show:
             top.withdraw()
+
+    def reassert_topmost(self):
+        if self.top.winfo_viewable():
+            # HWND_TOPMOST; SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+            user32.SetWindowPos(user32.GetParent(self.top.winfo_id()), wt.HWND(-1), 0, 0, 0, 0, 0x0013)
 
     def set_visible(self, show):
         if show:
@@ -1254,7 +1284,10 @@ class SettingsWindow:
         # ---- general
         general = ttk.Frame(nb, padding=12)
         nb.add(general, text=t("tab_general"))
-        self.adapters = SpeedMeter.adapters()
+        try:
+            self.adapters = SpeedMeter.adapters()
+        except Exception:
+            self.adapters = []
         self.adapter_names = [""] + [name for name, _, _ in self.adapters]
         labels = [t("adapter_auto")] + [desc + ("" if up else t("disconnected")) for _, desc, up in self.adapters]
         self.cb_adapter = ttk.Combobox(general, values=labels, state="readonly", width=42)
@@ -1411,6 +1444,7 @@ class CountdownDialog:
     """30-second countdown before the power action runs, with Cancel."""
 
     def __init__(self, app, action):
+        self.app = app
         self.action = t("power_actions")[action]
         self.action_index = action
         self.left = 30
@@ -1449,6 +1483,7 @@ class CountdownDialog:
 
     def finish(self):
         self.close()
+        self.app.save_all()
         run_power_action(self.action_index)
 
     def close(self):
@@ -1463,10 +1498,10 @@ def main():
         user32.SetProcessDPIAware()
     # Single instance. After a restart the old process may still be exiting, so wait a moment.
     for _ in range(30):
-        mutex = kernel32.CreateMutexW(None, False, "NetSpeedMonitor_SingleInstance")
-        if kernel32.GetLastError() != 183:   # ERROR_ALREADY_EXISTS
+        mutex = kernel32_le.CreateMutexW(None, False, "NetSpeedMonitor_SingleInstance")
+        if ctypes.get_last_error() != 183:   # ERROR_ALREADY_EXISTS
             break
-        kernel32.CloseHandle(mutex)
+        kernel32.CloseHandle(wt.HANDLE(mutex))
         if "--restart" not in sys.argv:
             return
         time.sleep(0.1)
@@ -1474,7 +1509,7 @@ def main():
         return
     app = App()
     app.run()
-    kernel32.CloseHandle(mutex)
+    kernel32.CloseHandle(wt.HANDLE(mutex))
     if app.restart_requested:
         subprocess.Popen([pythonw_path(), os.path.abspath(__file__), "--restart"])
 

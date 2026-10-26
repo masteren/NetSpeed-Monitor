@@ -49,7 +49,7 @@ pythonw netspeed.pyw
 | 网卡名称 | 通过 `ctypes` 调用 `iphlpapi.dll` 的 `GetIfTable2`，把“以太网”这类名称对应到网卡型号，再根据型号识别虚拟网卡。 |
 | 托盘图标 | 用一个隐藏窗口和 `ctypes` 写的窗口过程函数，直接调用 `Shell_NotifyIconW`，不依赖额外的库。窗口过程函数是在 tkinter 处理消息的过程中被调用的，所以它只把事件放进队列；如果在这里直接调用 tkinter，会清掉 tkinter 保存的线程状态，导致进程崩溃。 |
 | 存储 | 只用一个 JSON 文件。先写到临时文件再替换，写到一半时程序崩溃也不会损坏数据。 |
-| 显示 | 支持按显示器的 DPI 缩放，系统缩放调到 125%、150% 时文字也不会发虚。在 Windows 11 上用 `DwmSetWindowAttribute` 给悬浮窗加了圆角。 |
+| 显示 | 支持系统 DPI 缩放，系统缩放调到 125%、150% 时文字也不会发虚（多个显示器缩放比例不同时，副屏上的窗口由 Windows 拉伸显示，可能略微发虚）。在 Windows 11 上用 `DwmSetWindowAttribute` 给悬浮窗加了圆角。 |
 
 ## 隐私
 
