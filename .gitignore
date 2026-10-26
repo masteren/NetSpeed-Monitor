@@ -1,0 +1,11 @@
+# Personal data written by the app (settings + daily usage)
+netspeed.json
+netspeed.json.tmp
+
+# Local shortcuts and archives
+*.lnk
+*.zip
+
+# Python
+__pycache__/
+*.pyc
