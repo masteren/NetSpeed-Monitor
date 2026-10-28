@@ -872,10 +872,13 @@ class FloatWindow:
         self.canvas.pack()
         self.tip = None
         self.tip_job = None
+        # After a click (menu, drag) the hover tip stays off until the pointer leaves the window,
+        # so it never covers the menu or pops up again right after the menu closes.
+        self.tip_suppressed = False
         for event, handler in (("<ButtonPress-1>", self.on_drag_start), ("<B1-Motion>", self.on_drag_move),
                                ("<ButtonRelease-1>", self.on_drag_end),
                                ("<Double-Button-1>", lambda e: app.main.show()),
-                               ("<Button-3>", lambda e: app.menu.tk_popup(e.x_root, e.y_root)),
+                               ("<Button-3>", self.on_right_click),
                                ("<Enter>", self.on_enter), ("<Leave>", self.on_leave)):
             self.canvas.bind(event, handler)
         self.apply_settings()
@@ -945,15 +948,33 @@ class FloatWindow:
     # ---- hover: show today's usage
 
     def on_enter(self, e):
-        self.tip_job = self.top.after(600, self.show_tip)
+        if not self.tip_suppressed and self.tip_job is None and self.tip is None:
+            self.tip_job = self.top.after(600, self.show_tip)
 
     def on_leave(self, e):
+        self.hide_tip()
+        # A popup menu grabs the pointer, which also sends <Leave>; only a real exit re-enables the tip.
+        if not self.pointer_inside():
+            self.tip_suppressed = False
+
+    def pointer_inside(self):
+        x, y = self.top.winfo_pointerxy()
+        left, top = self.top.winfo_rootx(), self.top.winfo_rooty()
+        return left <= x < left + self.top.winfo_width() and top <= y < top + self.top.winfo_height()
+
+    def hide_tip(self, suppress=False):
+        if suppress:
+            self.tip_suppressed = True
         if self.tip_job:
             self.top.after_cancel(self.tip_job)
             self.tip_job = None
         if self.tip is not None:
             self.tip.destroy()
             self.tip = None
+
+    def on_right_click(self, e):
+        self.hide_tip(suppress=True)
+        self.app.menu.tk_popup(e.x_root, e.y_root)
 
     def show_tip(self):
         self.tip_job = None
@@ -980,7 +1001,7 @@ class FloatWindow:
     # ---- dragging (snaps to screen edges when released close to one)
 
     def on_drag_start(self, e):
-        self.on_leave(e)
+        self.hide_tip(suppress=True)
         self.drag_offset = (e.x_root - self.top.winfo_x(), e.y_root - self.top.winfo_y())
 
     def on_drag_move(self, e):
